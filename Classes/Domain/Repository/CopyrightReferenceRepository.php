@@ -42,40 +42,92 @@ class CopyrightReferenceRepository extends \TYPO3\CMS\Extbase\Persistence\Reposi
      */
     public function findByRootline($settings) {
 
-        $pidClause = $this->getStatementDefaults($settings['rootlines'], (bool) $settings['onlyCurrentPage']);
-        $additionalClause = '';
-
-        if((int)$settings['displayDuplicateImages'] === 0) {
-            $additionalClause .= ' GROUP BY file.uid';
-        }
-
         // First main statement, exclude by all possible exclusion reasons
         $preQuery = $this->createQuery();
 
-        $now = time();
+        $context = GeneralUtility::makeInstance(\TYPO3\CMS\Core\Context\Context::class);
+        $sysLanguage = (int) $context->getPropertyFromAspect('language', 'id');
 
-        // TODO: Migrate to QueryBuilder for Cross-DB-Engines
-        $statement = '
-          SELECT ref.* FROM sys_file_reference AS ref
-          LEFT JOIN sys_file AS file ON (file.uid=ref.uid_local)
-          LEFT JOIN sys_file_metadata AS meta ON (file.uid=meta.file)
-          LEFT JOIN pages AS p ON (ref.pid=p.uid)
-          WHERE (ref.copyright IS NOT NULL OR meta.copyright!="")
-          AND p.deleted=0 AND p.hidden=0 AND (p.starttime=0 OR p.starttime<=' . $now . ') AND (p.endtime=0 OR p.endtime>='. $now .')
-          AND file.missing=0 AND file.uid IS NOT NULL
-          AND ref.deleted=0 AND ref.hidden=0 AND ref.t3ver_wsid=0 ' . $pidClause . $additionalClause;
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable('sys_file_reference');
 
-        $preQuery->statement($statement);
+        $queryBuilder
+            ->selectLiteral('ref.uid', 'ref.tablenames', 'ref.uid_foreign', 'ref.copyright', 'metadata.copyright AS mcp', 'ref.pid')
+            ->from('sys_file_reference', 'ref')
+            ->leftJoin(
+                'ref',
+                'sys_file',
+                'file',
+                $queryBuilder->expr()->eq('file.uid', 'ref.uid_local')
+            )
+            ->leftJoin(
+                'file',
+                'sys_file_metadata',
+                'metadata',
+                $queryBuilder->expr()->eq('metadata.file', 'file.uid')
+            )
+            ->leftJoin(
+                'ref',
+                'pages',
+                'p',
+                $queryBuilder->expr()->eq('ref.pid', 'p.uid')
+            );
 
-        $preResults = $preQuery->execute(TRUE);
+        $constraints = [
+            $queryBuilder->expr()->eq('ref.sys_language_uid', $sysLanguage),
+            $queryBuilder->expr()->eq('missing', 0),
+            $queryBuilder->expr()->isNotNull('file.uid'),
+            $queryBuilder->expr()->in('file.type', [2, 5]),
+            $queryBuilder->expr()->orX(
+                $queryBuilder->expr()->isNotNull('ref.copyright'),
+                $queryBuilder->expr()->isNotNull('metadata.copyright'),
+            ),
+        ];
+
+        $queryBuilder
+            ->where(
+                ...$constraints
+            );
+
+        $this->getStatementDefaults($settings['rootlines'], $queryBuilder, (bool) $settings['onlyCurrentPage']);
+
+        $preResults = $queryBuilder->execute();
+
+        if((int)$settings['displayDuplicateImages'] === 0) {
+            $queryBuilder->groupBy('file.uid');
+        }
+
+        $typo3Version = new \TYPO3\CMS\Core\Information\Typo3Version();
+        if(version_compare($typo3Version->getVersion(),'11', '<')) {
+            $preResults = $preResults->fetchAll();
+        } else {
+            $preResults = $preResults->fetchAllAssociative();
+        }
 
         // Now check if the foreign record has a endtime field which is expired
         $finalRecords = $this->filterPreResultsReturnUids($preResults);
 
         // Final select
         if(false === empty($finalRecords)) {
-            $finalQuery = $this->createQuery();
-            return $finalQuery->statement('SELECT * FROM sys_file_reference WHERE uid IN(' . implode(',', $finalRecords) . ')')->execute();
+            $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
+                ->getQueryBuilderForTable('sys_file_reference');
+            $records = $queryBuilder
+                ->select('*')
+                ->from('sys_file_reference')
+                ->where(
+                    $queryBuilder->expr()->in('uid', $finalRecords)
+                )
+                ->execute();
+
+            if(version_compare($typo3Version->getVersion(),'11', '<')) {
+                $records = $records->fetchAll();
+                $objectManager = GeneralUtility::makeInstance(\TYPO3\CMS\Extbase\Object\ObjectManager::class);
+                $dataMapper = $objectManager->get(\TYPO3\CMS\Extbase\Persistence\Generic\Mapper\DataMapper::class);
+            } else {
+                $records = $records->fetchAllAssociative();
+                $dataMapper = GeneralUtility::makeInstance(\TYPO3\CMS\Extbase\Persistence\Generic\Mapper\DataMapper::class);
+            }
+
+            return $dataMapper->map(\TGM\TgmCopyright\Domain\Model\CopyrightReference::class, $records);
         }
 
         return [];
@@ -162,6 +214,26 @@ class CopyrightReferenceRepository extends \TYPO3\CMS\Extbase\Persistence\Reposi
     }
 
     /**
+     * @param string $rootlines
+     * @param \TYPO3\CMS\Core\Database\Query\QueryBuilder $qb
+     * @param bool $onlyCurrentPage
+     */
+    public function getStatementDefaults($rootlines, $qb, $onlyCurrentPage = false) {
+
+        $rootlines = (string) $rootlines;
+
+        if($onlyCurrentPage === true) {
+            $qb->andWhere(
+                $qb->expr()->eq('ref.pid', $GLOBALS['TSFE']->id)
+            );
+        } else if($rootlines !== '') {
+            $qb->andWhere(
+                $qb->expr()->in('ref.pid', $this->extendPidListByChildren($rootlines))
+            );
+        }
+    }
+
+    /**
      * This function will remove results which related table records are not hidden by endtime
      * @param array $preResults raw sql results to filter
      * @return array
@@ -207,29 +279,6 @@ class CopyrightReferenceRepository extends \TYPO3\CMS\Extbase\Persistence\Reposi
         }
 
         return $finalRecords;
-    }
-
-    /**
-     * @param string $rootlines
-     * @param bool $onlyCurrentPage
-     * @return string
-     * @throws \TYPO3\CMS\Core\Context\Exception\AspectNotFoundException
-     */
-    public function getStatementDefaults($rootlines, $onlyCurrentPage = false) {
-        $rootlines = (string) $rootlines;
-        $context = GeneralUtility::makeInstance(\TYPO3\CMS\Core\Context\Context::class);
-        $sysLanguage = (int) $context->getPropertyFromAspect('language', 'id');
-        $defaultStatement = ' AND ref.sys_language_uid=' . $sysLanguage;
-
-        if($onlyCurrentPage === true) {
-            $defaultStatement .= ' AND ref.pid=' . $GLOBALS['TSFE']->id;
-        } else if($rootlines!=='') {
-            $defaultStatement .= ' AND ref.pid IN('.$this->extendPidListByChildren($rootlines).')';
-        } else {
-            $defaultStatement .= '';
-        }
-
-        return $defaultStatement;
     }
 
     /**
